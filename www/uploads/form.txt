@@ -1,0 +1,7 @@
+--------------------------f6d229bf7e6d9ab7
+Content-Disposition: form-data; name="file"; filename="ws_upload.txt"
+Content-Type: text/plain
+
+hello upload test
+
+--------------------------f6d229bf7e6d9ab7--

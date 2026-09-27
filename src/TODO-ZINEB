@@ -1,0 +1,231 @@
+//parsing req
+"POST HTTP/1.1 200 ok\r\n"
+"Server: nginx/1.2.1\r\n"
+"Content-Type: text/html\r\n"
+"Content-Length: 8\r\n"
+"Connection: keep-alive\r\n"
+"\r\n"
+"<html />";
+
+
+---->setup websocket
+main()
+   ↓
+parse config
+   ↓
+create listening sockets
+   ↓
+multiplexing loop (poll)
+   ↓
+accept clients
+   ↓
+recv data
+   ↓
+parse HTTP
+   ↓
+build response
+   ↓
+send response
+
+socket + poll + accept + recv
+
+/TO-DO:
+socket
+setsocket
+bind
+listen
+loop epoll
+start multiplexing
+
+
+
+
+Now, here's what you need to do next:
+1 - Store data per client
+
+You need a map to store buffers for each client
+
+When data arrives, append to that client's buffer
+
+Don't just print and discard
+
+2 - Check for complete HTTP request
+
+After appending new data, search the client's buffer for "\r\n\r\n"
+
+This marks the end of HTTP headers
+
+If found, you have a complete request (at least the headers)
+
+3 - Handle the request
+
+Once you have complete headers, you can:
+
+Parse the request line (GET /path HTTP/1.1)
+
+Parse headers
+
+Check if there's a body (based on Content-Length or Transfer-Encoding)
+
+Generate a response
+
+4 - Don't close connection immediately
+
+HTTP can be persistent (Connection: keep-alive)
+
+Keep the connection open and wait for more requests
+--------------------------------------------------------------
+Your next steps in order:
+1 - Add a connections map as class member: std::map<int, std::string> _client_buffers;
+
+2 - In handleClient:
+
+Fix the recv to use the correct fd
+
+Append received data to _client_buffers[fd]
+
+Check if buffer contains "\r\n\r\n"
+
+If yes, process the request and send response
+
+If no, wait for more data (return without closing)
+
+3 - Handle client disconnect properly:
+
+When byte_received == 0, remove client from epoll, close fd, and erase from map
+
+4 - Remove client on error (byte_received == -1) only for fatal errors
+
+The key concept: stateful connections - each client maintains its own buffer across multiple read events until a complete request is received.
+
+
+-------------------------------------------------------------------------
+Yes, if you want this to be correct with nonblocking sockets, 
+you should switch to EPOLLOUT when there is pending response data to write.
+
+The usual flow is:
+
+build the response string after parsing the request
+store it in the connection state
+add EPOLLOUT to that client’s epoll events
+in the writable handler, call send()
+if send() writes only part of the buffer, keep the rest and wait for the next EPOLLOUT
+once everything is sent, remove EPOLLOUT and go back to EPOLLIN
+So not “use EPOLLOUT before every send” in the literal sense, but “register EPOLLOUT when you have something to send and finish sending in the write event.” That is the proper design for your current nonblocking setup.
+-------------------------------------------------------------------------
+
+
+bool Server::shouldCloseConnection(Connection& conn) {
+    std::map<std::string, std::string> headers = conn.request.getHeader();
+    std::map<std::string, std::string>::const_iterator it = headers.find("Connection");
+    
+    // If client explicitly asked to close, close it
+    if (it != headers.end() && it->second == "close")
+        return true;
+    
+    // If client asked for keep-alive, keep it open
+    if (it != headers.end() && it->second == "keep-alive")
+        return false;
+    
+    // Default: HTTP/1.1 keep-alive, HTTP/1.0 close
+    if (conn.request.getVersion() == "HTTP/1.1")
+        return false;  // Keep open
+    else
+        return true;   // Close
+}
+
+
+
+In closeTimedOutClients():
+
+For each timed out client:
+  - Check if socket is still valid (you can't really know without trying)
+  - Build 408 response
+  - Store in connection.response
+  - Set connection.force_close = true
+  - Change to EPOLLOUT (don't remove yet)
+  - Let handleWrite() try to send it
+
+
+In handleWrite():
+
+After sending:
+  - if (force_close) then removeClient()
+  - else check shouldCloseConnection()
+
+In removeClient():
+
+Only remove when:
+  - Response fully sent (for timeout case)
+  - Or socket is broken
+  - Or connection should close normally
+
+
+Why terminal tests close immediately:
+    Terminal commands like curl or telnet typically:
+
+    Send request
+
+    Receive response
+
+    Immediately close connection (no keep-alive)
+
+    This is correct behavior. Your server should respect that and close the connection.
+
+Debug suggestion:
+    // In closeTimedOutClients
+    std::cout << "Timeout detected for fd " << fd << ", sending 408" << std::endl;
+
+    // In handleWrite
+    std::cout << "Sending to fd " << fd << ", force_close = " << conn.force_close << std::endl;
+
+    // In removeClient
+    std::cout << "Removing fd " << fd << " (reason: " << (force_close ? "timeout" : "normal") << ")" << std::endl;
+
+
+
+
+
+
+void Server::removeClient(int fd)
+{
+    if(fd < 0)
+        return;
+    if(connections.find(fd) == connections.end())
+        return;
+     // Remove from epoll (if using epoll)
+    epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+    //close socket fd
+    close(fd);
+    //Remove from map
+                // Skip if connection was already queued for close or removed
+                std::map<int, Connection>::iterator it = connections.find(fd);
+                if (it == connections.end())
+                    continue;
+                Connection &conn = it->second;
+                if (conn.force_close || !conn.response.empty())
+                    continue; // already handled
+
+                // Queue 408 response once
+                conn.response = Response.buildErrorResponse(408);
+                conn.bytes_sent = 0;
+                conn.force_close = true;
+                conn.last_activity = now; // prevent immediate re-detection
+
+                // Switch to write mode so EPOLLOUT can flush the response
+                struct epoll_event ev;
+                ev.events = EPOLLOUT | EPOLLRDHUP;
+                ev.data.fd = fd;
+                epoll_ctl(_epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+
+                std::cout << "Timeout queued for fd: " << fd << std::endl;
+    for (size_t i = 0; i < locations.size(); i++) {
+        if (path.find(locations[i].path) == 0) { // Path starts with location path
+            if (locations[i].path.length() > bestMatchLen) {
+                bestMatchLen = locations[i].path.length();
+                bestMatch = &locations[i];
+            }
+        }
+    }
+    return bestMatch;
+}

@@ -1,0 +1,97 @@
+Great question! Here are the HTTP parsing errors you should handle in your parser:
+
+Request Line Errors:
+1. Invalid method
+Method not GET, POST, or DELETE
+
+Method is empty or contains invalid characters
+
+2. Invalid path
+Path is empty (just GET HTTP/1.1)
+
+Path doesn't start with /
+
+Path contains invalid characters (null bytes, control chars)
+
+3. Invalid HTTP version
+Version format wrong (not HTTP/1.0 or HTTP/1.1)
+
+Version missing or malformed (e.g., HTTP/1. or HTTP/2.0)
+
+4. Request line too long
+Line exceeds reasonable limit (e.g., 8192 bytes)
+
+5. Missing spaces
+No space between method and path
+
+No space between path and version
+
+Header Errors:
+6. Header line too long
+Individual header line exceeds limit
+
+7. Malformed header
+No colon : in header line
+
+Empty header name
+
+8. Duplicate headers
+Same header appears twice (except allowed ones like Cookie)
+
+9. Invalid header name
+Header name contains invalid characters
+
+Body Errors:
+10. Content-Length not a number
+Value contains non-digits (e.g., Content-Length: abc)
+
+11. Content-Length negative
+Value is negative number
+
+12. Content-Length too large
+Exceeds client_max_body_size from config
+
+13. Body size mismatch
+Received body size doesn't match Content-Length
+
+14. Chunked encoding errors (if you support HTTP/1.1)
+Invalid hex chunk size
+
+Missing CRLF after chunk
+
+Incomplete final chunk
+
+Method-Specific Errors (what you asked earlier):
+15. GET/DELETE with body
+Content-Length > 0 but method is GET or DELETE
+
+16. POST without Content-Length
+No way to know where body ends
+
+17. POST with empty body but Content-Length > 0
+Client said there's body but didn't send any
+
+What to do when you detect an error:
+Error Type	       HTTP Status	Action
+Method invalid	        405	    Set error flag, stop parsing
+Path invalid	        400	    Set error flag, stop parsing
+Version invalid	        505	    Set error flag, stop parsing
+Header malformed	    400	    Set error flag, stop parsing
+Content-Length invalid	400	    Set error flag, stop parsing
+Body too large	        413	    Set error flag, stop parsing
+GET with body	        400	    Set error flag
+POST no Content-Length	411	    Set error flag
+
+
+Simple approach for you:
+Start with these critical errors first:
+
+Invalid method (not GET/POST/DELETE)
+
+Missing or malformed request line
+
+Invalid Content-Length (non-numeric)
+
+Body exceeds max size
+
+Then add others as needed.

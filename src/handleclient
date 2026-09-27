@@ -1,0 +1,103 @@
+*Stage 3 - Body (if present):
+
+-If Content-Length: read exactly that many bytes after headers
+-If chunked: implement chunked decoding
+-If no body, request is complete
+
+5 - Generate response (simplified for now):
+
+Based on method and path
+
+Return 200 OK with a simple page
+
+Or 404 if file not found
+
+
+how can i work with response, is it like this # include "../includes/Client.hpp"
+
+Step-by-step after handleClient:
+1 - In handleClient, after appending data to client buffer:
+```_client_buffers[fd] += std::string(buffer.begin(), buffer.end());```
+
+2 - Check for complete headers:
+
+Look for "\r\n\r\n" in the buffer
+
+If NOT found → return and wait for more data
+
+If found → proceed to parsing
+
+3 - Create a Request Parser class/function:
+
+Extract request line (first line until \r\n)
+
+Extract headers (subsequent lines until empty line)
+
+Check for body (if Content-Length or Transfer-Encoding: chunked)
+
+4 - Parse in stages:
+
+*Stage 1 - Request Line:
+
+-Split by spaces: "GET /index.html HTTP/1.1"
+-Extract: method, path, HTTP version
+
+*Stage 2 - Headers:
+
+-Parse each line until empty line
+-Store in map: "Content-Type: text/html" → key="Content-Type", value="text/html"
+-Look for important headers: Host, Content-Length, Transfer-Encoding, Connection
+
+
+static std::string buildResponse(const std::string& status, const std::string& contentType, const std::string& body)
+{
+    std::ostringstream oss;
+    oss << "HTTP/1.1 " << status << "\r\n";
+    oss << "Content-Type: " << contentType << "\r\n";
+    oss << "Content-Length: " << body.size() << "\r\n";
+    oss << "Connection: close\r\n";
+    oss << "\r\n";
+    oss << body;
+    return oss.str();
+}
+
+std::string Client::generateResponse(Connection& conn)
+{
+    std::string response;
+    std::string getMeth;
+    getMeth = conn.request.getMethod();
+    if (getMeth == "GET")
+    {
+        std::string reqPath = conn.request.getPath();
+        if (reqPath.empty() || reqPath == "/")
+            reqPath = "/index.html";
+
+        std::string filePath = "www/html" + reqPath;
+        std::ifstream file(filePath.c_str(), std::ios::in | std::ios::binary);
+        if (!file)
+        {
+            std::string body = "<html><body><h1>404 Not Found</h1></body></html>";
+            return buildResponse("404 Not Found", "text/html", body);
+        }
+
+        std::ostringstream bodyStream;
+        bodyStream << file.rdbuf();
+        response = buildResponse("200 OK", "text/html", bodyStream.str());
+    }
+    else if (getMeth == "POST")
+    {
+        std::string body = "<html><body><h1>POST request received</h1></body></html>";
+        response = buildResponse("200 OK", "text/html", body);
+    }
+    else if (getMeth == "DELETE")
+    {
+        std::string body = "<html><body><h1>DELETE request received</h1></body></html>";
+        response = buildResponse("200 OK", "text/html", body);
+    }
+    else
+    {
+        response = buildResponse("405 Method Not Allowed", "text/plain", "");
+    }
+    
+    return response;
+}

@@ -1,0 +1,173 @@
+Short answer: because browsers don't behave like an interactive test client (nc/curl stdin). Most browsers either send the full request immediately or they give up/abort before your server's late 408 arrives — so the HTML can be built by the server but never actually delivered or rendered by the browser.
+
+Why that happens (most common causes)
+
+Client closed first: The browser (or its TCP stack) closed the connection before the server finished sending the 408 page. If the client closes, the HTML never arrives.
+Browser never sent a “partial” request: Typical browser requests include the full body (or they use chunked/transfer rules). You usually can't make a browser send just headers and then wait — so the server never has a reason to send 408 in that scenario.
+Response arrived after navigation/context change: If the browser already gave up, the response can arrive but won't be displayed.
+Server sent but not flushed: If you closed the socket too early (we fixed that), bytes could have been dropped. (You already changed code to queue and flush the response.)
+Browser devtools: The page might be available in Network → Response, but not shown as a rendered page if the navigation completed/failed.
+How to verify the HTML actually got sent (use these first)
+
+Check server logs
+
+Look for a single sequence: "Timeout queued for fd: N" → "force close 1" → "Client N Removed".
+If you see queuing but no "force close" or remove, the write didn't complete.
+Test with an interactive client (reliable)
+
+Netcat (recommended):
+Terminal A: nc localhost 8080
+
+Paste:
+POST / HTTP/1.1
+Host: localhost
+Content-Length: 100
+
+(then do nothing and wait past your timeout)
+
+Expect: you will receive the full HTTP/1.1 408 response plus HTML, then the socket closes.
+
+Curl (stdin mode):
+curl -v -X POST -H "Content-Length: 100" --data-binary @- http://localhost:8080
+Wait without typing 100 bytes; curl will show the response when the server sends it (if curl keeps connection open).
+These are deterministic — if these show the 408 HTML, your server is sending correctly.
+Test with browser devtools (less reliable)
+
+Open DevTools → Network.
+Make a request from the UI that actually leaves the socket open (hard to do).
+If DevTools shows a 408 response under Network and a response body, the browser received it.
+If devtools shows no response or the request failed/aborted, the browser closed the connection or gave up.
+If you want to make the browser show it (harder)
+
+Browsers typically won't send a header-only partial POST the way nc/curl can, so reproducing the server timeout from a normal page is difficult.
+You can test programmatically with a custom test client (nc/curl/socat) or write a small Node.js script that opens a socket and sends headers only, then waits and reads the response — that will reliably show the 408 HTML.
+Optional small debug additions (I can add for you)
+
+Add logs to handleWrite() to print bytes remaining (helps ensure the response is fully flushed):
+Print conn.bytes_sent and conn.response.size() each write.
+Add server-side timestamped logs when queuing and when fully sent to correlate with client behavior.
+Which of these do you want next?
+
+I can give the exact nc/curl commands again (copy-paste).
+I can add the handleWrite() debug prints and rebuild so you can see bytes remaining.
+I can provide a tiny Node.js test client that simulates header-only POST and validates the 408 HTML in the browser-like way.
+Pick one and I’ll do it.
+
+GPT-5 mini • 0x
+
+
+
+
+------------------------
+Good — that approach is reasonable and efficient. Plan: I'll outline a safe, minimal design for "record header + start-of-body + length" and then show concrete implementation ideas and test commands.
+
+High-level design
+
+Parse headers only and stop when you see CRLFCRLF.
+Record:
+header_end = index after "\r\n\r\n"
+content_length (from headers)
+initial_body_bytes = buffer.size() - header_end (may be 0)
+Switch from buffering-in-memory to streaming-to-disk:
+Create a temp file (use mkstemp) and write the initial_body_bytes to it.
+Track bytes_written (initial_body_bytes).
+Clear consumed data from in-memory buffer (keep any bytes after body if pipelining).
+Keep the connection registered for EPOLLIN to receive more chunks.
+On each subsequent recv:
+Write newly received bytes directly to the temp file, increment bytes_written.
+When bytes_written == content_length → upload complete: close temp file, move to final filename (atomic rename), queue response (201 or whatever) and switch to EPOLLOUT.
+Error/timeout cases:
+If bytes_written > content_length → respond 413 and delete temp file.
+On I/O error → respond 500, delete temp file.
+On timeout → you may delete partial file or keep for resume depending on policy.
+Advantages:
+Minimal memory usage (only small buffer and a temp file).
+Works for arbitrarily large uploads (images, video, pdf, audio).
+Concrete fields to add (in your connection/request struct)
+
+req.contentLength (you already have)
+req.body_start_index or header_end (size_t) — optional if you write existing body out immediately
+req.temp_path (string) — path to temporary file
+req.file_fd (int) — open file descriptor (or use std::ofstream)
+req.bytes_written (size_t)
+Sketch of code changes (pseudo/C++ snippets)
+
+// After detecting headers (inside handleClient)
+size_t header_end = pos + 4; // pos is index of "\r\n\r\n"
+size_t available = connections[fd].buffer.size() - header_end;
+if (connections[fd].request.getValue("Content-Length").size() > 0)
+{
+connections[fd].request.contentLength = atoi(connections[fd].request.getValue("Content-Length").c_str());
+// create temp file
+char tmpl[] = "/tmp/webserv-upload-XXXXXX";
+int tmpfd = mkstemp(tmpl);
+if (tmpfd == -1) { /* handle error: 500 / }
+connections[fd].request.file_fd = tmpfd;
+connections[fd].request.temp_path = std::string(tmpl);
+// write the body chunk already in buffer
+if (available > 0) {
+ssize_t w = write(tmpfd, connections[fd].buffer.c_str() + header_end, available);
+if (w <= 0) { / handle error */ }
+connections[fd].request.bytes_written += w;
+}
+// remove the header+body-slice from buffer (or clear completely)
+connections[fd].buffer.erase(0, header_end + available);
+// keep connection in EPOLLIN to receive more body bytes
+// set a flag so you don't re-parse headers
+connections[fd].request_parsed = true; // but interpret as body streaming not "done"
+}
+
+// When you receive new data (in handleClient else branch)
+if (connections[fd].request_parsed && connections[fd].request.file_fd != -1) {
+// This connection is currently streaming a body to disk
+ssize_t w = write(connections[fd].request.file_fd, recv_buf, recv_len);
+connections[fd].request.bytes_written += w;
+if (connections[fd].request.bytes_written >= connections[fd].request.contentLength) {
+// done: close tmp file, atomically move to destination
+close(connections[fd].request.file_fd);
+std::string final = computeDestinationPath(...);
+rename(connections[fd].request.temp_path.c_str(), final.c_str()); // atomic
+// prepare response e.g. 201 Created
+connections[fd].response = buildResponse(...);
+// switch to EPOLLOUT to send response
+mod epoll to EPOLLOUT
+}
+}
+
+Notes and best-practices
+
+Use mkstemp to safely create temp files, set restrictive permissions.
+Use atomic rename (rename()) to move temp file into final location.
+Always check return values for write() and handle EINTR/EAGAIN properly (for non-blocking writes you might need to buffer leftover bytes — though for file descriptor writes to disk they're usually blocking; you can open temp file as blocking).
+For chunked transfer-encoding you must implement chunk parsing; if you only support Content-Length, reject Transfer-Encoding header (501).
+For multipart/form-data you may need to parse boundaries; for simple file uploads it's okay to save the raw body and let a downstream processor parse multipart parts.
+Cleanup on connection close: delete temp file if partial and policy says so.
+Initialize req.bytes_written and req.file_fd for each request.
+Simpler alternative (if you prefer minimal change)
+
+Keep existing buffer until body complete (works but memory-heavy for large files).
+Or write only when body size exceeds threshold (e.g., 1 MB) — hybrid approach.
+Testing with curl / Postman
+
+Upload whole file (server will stream it):
+CONTENT_LENGTH=$(wc -c < /path/to/file)
+curl -v -X POST -H "Content-Type: application/octet-stream" -H "Content-Length: $CONTENT_LENGTH" --data-binary "@/path/to/file" http://localhost:8080/uploads/targetname
+Stream slowly (tests server handling chunks):
+requires pv
+CONTENT_LENGTH=$(wc -c < /path/to/file)
+pv -L 10k /path/to/file | curl -v -X POST -H "Content-Type: application/octet-stream" -H "Content-Length: $CONTENT_LENGTH" --data-binary @- http://localhost:8080/uploads/targetname
+Postman: choose POST, raw/binary body, pick file, and ensure Content-Length header is set (Postman usually sets it).
+Edge-cases to validate
+
+Ensure Content-Length present for POST uploads (you already set 411).
+Reject Transfer-Encoding: chunked if not implemented.
+Enforce max upload size (client_max_body_size).
+Secure upload paths (sanitize file names and use config upload path).
+Permissions and group ownership for saved files.
+Would you like:
+
+A concrete patch to Server.cpp / request-parse.cpp implementing the temp-file streaming flow above, or
+A smaller “write-to-disk-after threshold” patch?
+Tell me which and I’ll implement the code changes.
+
+GPT-5 mini • 0x
